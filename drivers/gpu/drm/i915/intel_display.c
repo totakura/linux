@@ -53,6 +53,14 @@ static int intel_set_mode(struct drm_crtc *crtc, struct drm_display_mode *mode,
 			  int x, int y, struct drm_framebuffer *old_fb);
 
 
+static struct intel_encoder *intel_find_encoder(struct intel_connector *connector, int pipe)
+{
+	if (!connector->mst_port)
+		return connector->encoder;
+	else
+		return &connector->mst_port->mst_encoders[pipe]->base;
+}
+
 typedef struct {
 	int	min, max;
 } intel_range_t;
@@ -3739,6 +3747,9 @@ static void haswell_crtc_enable(struct drm_crtc *crtc)
 	if (intel_crtc->config.has_pch_encoder)
 		lpt_pch_enable(crtc);
 
+	if (intel_crtc->config.dp_encoder_is_mst)
+		intel_ddi_set_vc_payload_alloc(crtc, true);
+
 	for_each_encoder_on_crtc(dev, crtc, encoder) {
 		encoder->enable(encoder);
 		intel_opregion_notify_encoder(encoder, true);
@@ -3806,6 +3817,9 @@ static void ironlake_crtc_disable(struct drm_crtc *crtc)
 		intel_set_pch_fifo_underrun_reporting(dev, pipe, false);
 
 	intel_disable_pipe(dev_priv, pipe);
+
+	if (intel_crtc->config.dp_encoder_is_mst)
+		intel_ddi_set_vc_payload_alloc(crtc, false);
 
 	ironlake_pfit_disable(intel_crtc);
 
@@ -4427,20 +4441,23 @@ static void intel_connector_check_state(struct intel_connector *connector)
 		     "wrong connector dpms state\n");
 		WARN(connector->base.encoder != &encoder->base,
 		     "active connector not linked to encoder\n");
-		WARN(!encoder->connectors_active,
-		     "encoder->connectors_active not set\n");
 
-		encoder_enabled = encoder->get_hw_state(encoder, &pipe);
-		WARN(!encoder_enabled, "encoder not enabled\n");
-		if (WARN_ON(!encoder->base.crtc))
-			return;
+		if (encoder) {
+			WARN(!encoder->connectors_active,
+			     "encoder->connectors_active not set\n");
 
-		crtc = encoder->base.crtc;
+			encoder_enabled = encoder->get_hw_state(encoder, &pipe);
+			WARN(!encoder_enabled, "encoder not enabled\n");
+			if (WARN_ON(!encoder->base.crtc))
+				return;
 
-		WARN(!crtc->enabled, "crtc not enabled\n");
-		WARN(!to_intel_crtc(crtc)->active, "crtc not active\n");
-		WARN(pipe != to_intel_crtc(crtc)->pipe,
-		     "encoder active on the wrong pipe\n");
+			crtc = encoder->base.crtc;
+
+			WARN(!crtc->enabled, "crtc not enabled\n");
+			WARN(!to_intel_crtc(crtc)->active, "crtc not active\n");
+			WARN(pipe != to_intel_crtc(crtc)->pipe,
+			     "encoder active on the wrong pipe\n");
+		}
 	}
 }
 
@@ -9892,7 +9909,7 @@ intel_modeset_stage_output_state(struct drm_device *dev,
 		 * for them. */
 		for (ro = 0; ro < set->num_connectors; ro++) {
 			if (set->connectors[ro] == &connector->base) {
-				connector->new_encoder = connector->encoder;
+				connector->new_encoder = intel_find_encoder(connector, to_intel_crtc(set->crtc)->pipe);
 				break;
 			}
 		}
@@ -9936,7 +9953,7 @@ intel_modeset_stage_output_state(struct drm_device *dev,
 					 new_crtc)) {
 			return -EINVAL;
 		}
-		connector->encoder->new_crtc = to_intel_crtc(new_crtc);
+		connector->new_encoder->new_crtc = to_intel_crtc(new_crtc);
 
 		DRM_DEBUG_KMS("[CONNECTOR:%d:%s] to [CRTC:%d]\n",
 			connector->base.base.id,
@@ -9970,6 +9987,12 @@ intel_modeset_stage_output_state(struct drm_device *dev,
 		}
 	}
 	/* Now we've also updated encoder->new_crtc for all encoders. */
+	list_for_each_entry(connector, &dev->mode_config.connector_list,
+			    base.head) {
+		if (connector->new_encoder)
+			if (connector->new_encoder != connector->encoder)
+				connector->encoder = connector->new_encoder;
+	}
 
 	return 0;
 }
@@ -11334,6 +11357,14 @@ void intel_modeset_gem_init(struct drm_device *dev)
 	mutex_unlock(&dev->mode_config.mutex);
 }
 
+void intel_connector_unregister(struct intel_connector *intel_connector)
+{
+	struct drm_connector *connector = &intel_connector->base;
+
+	intel_panel_destroy_backlight(connector);
+	drm_sysfs_connector_remove(connector);
+}
+
 void intel_modeset_cleanup(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
@@ -11378,8 +11409,10 @@ void intel_modeset_cleanup(struct drm_device *dev)
 
 	/* destroy the backlight and sysfs files before encoders/connectors */
 	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
-		intel_panel_destroy_backlight(connector);
-		drm_sysfs_connector_remove(connector);
+		struct intel_connector *intel_connector;
+
+		intel_connector = to_intel_connector(connector);
+		intel_connector->unregister(intel_connector);
 	}
 
 	drm_mode_config_cleanup(dev);

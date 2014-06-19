@@ -32,7 +32,7 @@
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_fb_helper.h>
-#include <drm/drm_dp_helper.h>
+#include <drm/drm_dp_mst_helper.h>
 
 /**
  * _wait_for - magic (register) wait macro
@@ -94,6 +94,7 @@
 #define INTEL_OUTPUT_EDP 8
 #define INTEL_OUTPUT_DSI 9
 #define INTEL_OUTPUT_UNKNOWN 10
+#define INTEL_OUTPUT_DP_MST 11
 
 #define INTEL_DVO_CHIP_NONE 0
 #define INTEL_DVO_CHIP_LVDS 1
@@ -187,6 +188,14 @@ struct intel_connector {
 	 * and active (i.e. dpms ON state). */
 	bool (*get_hw_state)(struct intel_connector *);
 
+	/*
+	 * Removes all interfaces through which the connector is accessible
+	 * - like sysfs, debugfs entries -, so that no new operations can be
+	 * started on the connector. Also makes sure all currently pending
+	 * operations finish before returing.
+	 */
+	void (*unregister)(struct intel_connector *);
+
 	/* Panel info for eDP and LVDS */
 	struct intel_panel panel;
 
@@ -196,6 +205,10 @@ struct intel_connector {
 	/* since POLL and HPD connectors may use the same HPD line keep the native
 	   state of connector->polled in case hotplug storm detection changes it */
 	u8 polled;
+
+	void *port; /* store this opaque as its illegal to dereference it */
+
+	struct intel_dp *mst_port;
 };
 
 typedef struct dpll {
@@ -319,6 +332,9 @@ struct intel_crtc_config {
 	bool ips_enabled;
 
 	bool double_wide;
+
+	bool dp_encoder_is_mst;
+	int pbn;
 };
 
 struct intel_pipe_wm {
@@ -460,6 +476,7 @@ struct intel_hdmi {
 			       struct drm_display_mode *adjusted_mode);
 };
 
+struct intel_dp_mst_encoder;
 #define DP_MAX_DOWNSTREAM_PORTS		0x10
 
 struct intel_dp {
@@ -475,8 +492,7 @@ struct intel_dp {
 	uint8_t dpcd[DP_RECEIVER_CAP_SIZE];
 	uint8_t psr_dpcd[EDP_PSR_RECEIVER_CAP_SIZE];
 	uint8_t downstream_ports[DP_MAX_DOWNSTREAM_PORTS];
-	struct i2c_adapter adapter;
-	struct i2c_algo_dp_aux_data algo;
+	struct drm_dp_aux aux;
 	uint8_t train_set[4];
 	int panel_power_up_delay;
 	int panel_power_down_delay;
@@ -486,7 +502,17 @@ struct intel_dp {
 	struct delayed_work panel_vdd_work;
 	bool want_panel_vdd;
 	bool psr_setup_done;
+	bool use_tps3;
+	bool can_mst; /* this port supports mst */
+	bool is_mst;
+	int active_mst_links;
+	/* connector directly attached - won't be use for modeset in mst world */
 	struct intel_connector *attached_connector;
+
+	/* mst connector list */
+	struct intel_connector *mst_connectors;
+	struct intel_dp_mst_encoder *mst_encoders[I915_MAX_PIPES];
+	struct drm_dp_mst_topology_mgr mst_mgr;
 };
 
 struct intel_digital_port {
@@ -495,6 +521,13 @@ struct intel_digital_port {
 	u32 saved_port_bits;
 	struct intel_dp dp;
 	struct intel_hdmi hdmi;
+};
+
+struct intel_dp_mst_encoder {
+	struct intel_encoder base;
+	enum pipe pipe;
+	struct intel_digital_port *primary;
+	void *port; /* store this opaque as its illegal to dereference it */
 };
 
 static inline int
@@ -563,6 +596,12 @@ enc_to_dig_port(struct drm_encoder *encoder)
 	return container_of(encoder, struct intel_digital_port, base.base);
 }
 
+static inline struct intel_dp_mst_encoder *
+enc_to_mst(struct drm_encoder *encoder)
+{
+	return container_of(encoder, struct intel_dp_mst_encoder, base.base);
+}
+
 static inline struct intel_dp *enc_to_intel_dp(struct drm_encoder *encoder)
 {
 	return &enc_to_dig_port(encoder)->dp;
@@ -623,6 +662,9 @@ void intel_ddi_fdi_disable(struct drm_crtc *crtc);
 void intel_ddi_get_config(struct intel_encoder *encoder,
 			  struct intel_crtc_config *pipe_config);
 
+void intel_ddi_mode_set_dp(struct intel_encoder *encoder);
+void intel_ddi_force_act(struct intel_encoder *encoder, bool state);
+void intel_ddi_set_vc_payload_alloc(struct drm_crtc *crtc, bool state);
 
 /* intel_display.c */
 const char *intel_output_name(int output);
@@ -735,6 +777,14 @@ void intel_edp_psr_disable(struct intel_dp *intel_dp);
 void intel_edp_psr_update(struct drm_device *dev);
 
 
+int intel_dp_handle_hpd_irq(struct intel_digital_port *digport, bool long_hpd);
+void intel_dp_add_properties(struct intel_dp *intel_dp, struct drm_connector *connector);
+void intel_dp_mst_suspend(struct drm_device *dev);
+void intel_dp_mst_resume(struct drm_device *dev);
+
+/* intel_dp_mst.c */
+int intel_dp_mst_encoder_init(struct intel_digital_port *intel_dig_port, int conn_id);
+void intel_dp_mst_encoder_cleanup(struct intel_digital_port *intel_dig_port);
 /* intel_dsi.c */
 bool intel_dsi_init(struct drm_device *dev);
 
